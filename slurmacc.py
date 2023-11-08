@@ -1,165 +1,389 @@
 #!/usr/bin/env python3
 
-import optparse
-import io
+import os
+import sys
+import logging
 import subprocess
-import pandas
-import datetime
+from configparser import ConfigParser
+from optparse import OptionParser
 from datetime import date
+from io import StringIO
 
-def getargs():
+import pandas as pd
+import sqlalchemy
 
-    today=date.today()
+
+def setup_logging():
+    logging.basicConfig(
+        format="%(levelname)s %(asctime)s %(message)s", datefmt="%H:%M:%S",
+        level=logging.ERROR,
+        handlers=[logging.StreamHandler(sys.stderr)]
+    )
+
+
+def parse_args():
+    today = date.today()
 
     usage = "usage: %prog [options]"
-    parser = optparse.OptionParser(usage=usage)
+    parser = OptionParser(usage=usage)
 
-    parser.add_option("-d","--debug", dest="debug", default=False, action="store_true",
-                      help="Shows progress of program, ")
+    parser.add_option("-b", "--debug", dest="debug", default=False, action="store_true",
+                      help="Shows extra information about the progression of the program")
 
-    parser.add_option("-c","--cputime", dest="cputime", default=False, action="store_true",
-                      help="Report on used cpu time (hours), "+
-                     "the default is to report on used wallclock time (hours).")
+    parser.add_option("-g", "--config", dest="config_file", default="config.ini",
+                      help="Path to the config file used by the script. Defaults to 'config.ini'")
 
-    parser.add_option("-m","--energy", dest="energy", default=False, action="store_true",
-                      help="Report on used energy (joules)")
+    parser.add_option("-s", "--start_date", dest="start_date",
+                      default=str(date(today.year - 1, today.month, today.day)),
+                      help="Only include accounting records from this date on. " +
+                           "Defaults to one year ago. Format: yyyy-mm-dd.")
 
-    parser.add_option("-j","--jobs", dest="jobs", default=False, action="store_true",
-                      help="Report on number of jobs run, "+
-                      "the default is to report on used wallclock time (hours).")
-
-    parser.add_option("-s","--startdate",dest="startdate", 
-                      default=str(datetime.date(today.year-1,today.month,today.day)),
-                      help="Only include accounting records from this date on, " +
-                      "format yyyy-m-d.")
-
-    parser.add_option("-e","--enddate",dest="enddate", default=str(today),
+    parser.add_option("-e", "--end_date", dest="end_date", default=str(today),
                       help="Only include accounting records for up to, " +
-                      "and not including this date , format yyyy-m-d.")
+                           "and not including this date. Defaults to today. Format yyyy-mm-dd.")
 
-    parser.add_option("-u","--user", dest="user", default=False, action="store_true",
-                      help="Present accounting information for all users by their name. ")
+    parser.add_option("-a", "--accounts", dest="accounts", default="",
+                      help="Query data only for the selected accounts. To add multiple accounts,"
+                           "pass them separated by , with no spaces. Defaults to querying for "
+                           "all accounts")
 
-    parser.add_option("-i","--uid", dest="uid", default=False, action="store_true",
-                      help="Display user information based on uid, instead of full name ")
+    parser.add_option("-c", "--cpu_time", dest="cpu_time", default=False, action="store_true",
+                      help="Report on used cpu time (units defined by -t). "
+                           "Mutually exclusive with -j. " +
+                           "Default behaviour if no metric argument is provided")
 
-    parser.add_option("-r","--research", dest="researchgroup", default=False, action="store_true",
-                      help="Present accounting information for this " +
-                      "comma separated list of research groups. " +
-                      "Specifying all will result in information " +
-                      "aggregated per research institute for all research groups"
-                      "Specifying list will result in a list of known groups.")
+    parser.add_option("-j", "--jobs", dest="jobs", default=False, action="store_true",
+                      help="Report on number of jobs run. Mutually exclusive with -c")
 
-    parser.add_option("-f","--faculty", dest="faculty", default=False, action="store_true",
-                      help="Present accounting information for this " +
-                      "comma separated list of faculties. Specifying all" +
-                      "will result in information aggregated per faculty for all faculties"
-                      "Specifying list will result in a list of known groups.")
+    time_units = ["h", "m", "s", "p"]
 
-    parser.add_option("-o","--sort", dest="sort", default=False, action="store_true",
-                      help="Sort table on user, group, faculty or research " +
-                      "institute, instead of on used time.")
+    parser.add_option("-t", "--time", dest="time_unit", default='m',
+                      help=f"Output time unit for -c. Must be one of ({', '.join(time_units)}), "
+                           f"where p is %.Defaults to minutes.")
 
-    parser.add_option("-x","--csv", dest="csv", default=False, action="store_true",
-                      help="Show results in comma separated value format")
+    parser.add_option("-n", "--name", dest="name", default=False, action="store_true",
+                      help="Use the full name instead of the username for user accounting information")
 
-    parser.add_option("-t","--time",dest="time", default='m',
-                      help="Output time unit, default is in minutes.")
+    parser.add_option("-u", "--user", dest="user", default=False, action="store_true",
+                      help="Present accounting information for individual users")
 
-    parser.add_option("-n","--filename", dest="userdata", default="PersonDB.csv",
-                      help="Filename for csv file with user data.")
+    parser.add_option("-d", "--department", dest="department", default=False, action="store_true",
+                      help="Present accounting information for departments")
 
-    (options, args) = parser.parse_args()
-    if options.cputime and options.energy:
-        parser.error("Options -n and -m are mutually exclusive.")
-    if options.uid and options.person:
-        parser.error("Options -u and -d are mutually exclusive.")
+    parser.add_option("-f", "--faculty", dest="faculty", default=False, action="store_true",
+                      help="Present accounting information faculties")
+
+    parser.add_option("-o", "--sort", dest="sort", default=False, action="store_true",
+                      help="Sort table on on cpu time instead of account, faculty department or user")
+
+    parser.add_option("-v", "--view", dest="view", default=False, action="store_true",
+                      help="Prints the results to the screen in human readable format. Default "
+                           "behaviour if no output argument is provided")
+
+    parser.add_option("-x", "--csv", dest="csv", default=False, action="store_true",
+                      help="Output results in comma separated value format, in a file named "
+                           "usage_<metric>_<start-date>-<end-date>")
+
+    # TODO: maybe add flag for generating for all users
+
+    options, args = parser.parse_args()
+
+    if options.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    logging.debug("Checking arguments.")
+
+    if os.path.isdir(options.config_file):
+        logging.error("Config path points to a directory")
+        exit(1)
+
     try:
-         startdate = pandas.Timestamp(options.startdate)
-         enddate = pandas.Timestamp(options.enddate)
+        options.start_date = pd.Timestamp(options.start_date)
+        options.end_date = pd.Timestamp(options.end_date)
     except:
-        parser.error("Wrong date specified for -s or -e, use the format YYYY-MM-DD")
-    if len(args) !=0:
-        parser.error("Unrecognised arguments supplied")
-    if startdate > enddate:
-        parser.error("Start date must be before the end date.")
+        logging.error("Wrong date specified for -s or -e, use the format yyyy-mm-dd")
+        exit(1)
+
+    if options.start_date > options.end_date:
+        logging.error("start date cannot be after end date")
+        exit(1)
+
+    options.start_date = options.start_date.strftime("%Y-%m-%d")
+    options.end_date = options.end_date.strftime("%Y-%m-%d")
+
+    if options.cpu_time and options.jobs:
+        logging.error("Options -c and -j are mutually exclusive")
+        exit(1)
+
+    if not any([options.cpu_time, options.jobs]):
+        logging.debug("No metric argument provided. Using CPU time")
+        options.cpu_time = True
+
+    if options.time_unit not in time_units:
+        logging.error(f"Invalid time unit selected: '{options.time_unit}'. Must be one of {', '.join(time_units)}")
+        exit(1)
+
+    if not any([options.view, options.csv]):
+        logging.debug("No output argument provided. Printing to screen")
+        options.view = True
+
+    logging.debug("Finished checking arguments")
     return options
 
-def CPUTime(s, e, timeunit):
-    # s = startdate, e = enddate.
-    encoding = 'ascii'    # specify the encoding of the CSV data
+
+def parse_configs(options):
+    logging.debug(f"Reading config file {options.config_file}")
+    cfg = ConfigParser()
+
+    # Dictionary containing default values, used for creating new config files and checking all variables are present
+    defaults = {
+        'database': {
+            'username': 'placeholder',
+            'password': 'placeholder',
+            'host': 'database1',
+            'database': 'hb_useradmin'
+        }
+    }
+
+    # If the config file does not exist, create a skeleton for it and exit
+    if not os.path.exists(options.config_file):
+        logging.debug("Config file does not exist. Creating it with default values")
+
+        for section, variables in defaults.items():
+            cfg.add_section(section)
+            for variable, value in variables.items():
+                cfg.set(section, variable, value)
+
+        with open(options.config_file, "x") as cfg_file:
+            cfg.write(cfg_file)
+
+        logging.error(f"Config file has been created at '{options.config_file}'.\n"
+                      f"Provide database (user) credentials in it and run the script again")
+        exit(1)
+
+    # If it does exist, read it and check it contains all required values
+    logging.debug("Checking that config file contains all required values")
+    with open(options.config_file, "r") as cfg_file:
+        cfg.read_file(open(options.config_file))
+
+    all_present = all(
+        cfg.has_section(section) and  # check if section exists
+        all((cfg.has_option(section, option) for option in variables))  # check if section contains all vars
+        for section, variables in defaults.items()
+    )
+
+    if not all_present:
+        logging.error(f"Config file does not contain the required data.\n")
+        exit(1)
+
+    logging.debug("Finished reading config file")
+    return cfg
+
+
+def get_usage_data(options):
+    logging.debug("Gathering usage data with sreport")
+
+    command = ['sreport', "-P"]
+
+    if options.cpu_time:
+        command.extend(["cluster", "AccountUtilizationByUser",
+                        "-t" + str(options.time_unit), "format=Login,Account,Used"])
+    elif options.jobs:
+        command.extend(["job", "SizesByAccount", "PrintJobCount", "FlatView"])
+
+    command.extend(["start=" + str(options.start_date), "end=" + str(options.end_date)])
+    if options.accounts != "":
+        command.append("Accounts="+options.accounts)
+
     try:
-        sreport = subprocess.Popen(["sreport", "cluster", 
-                                   "AccountUtilizationByUser","-t"+timeunit,  
-                                   "start="+s, "end="+e, 
-                                   "format=Login,Account,Used,Energy","-P"], 
-                                   stdout=subprocess.PIPE)
-    
-        csvData = io.StringIO(sreport.stdout.read().decode())
-        usage = pandas.read_csv(csvData, delimiter='|', skiprows=4)
-    except:
-        print("Error reading data from sreport.")
-        print("Command used:")
-        print("    sreport cluster AccountUtilizationByUser -t %s start=%s " % (timeunit, e) + 
-              "end=%s format=Login,Account,Used,Energy -P" % e)
-    usage = usage[pandas.notnull(usage.Login)]
-    return usage
+        logging.debug(f"Starting subprocess with command {' '.join(command)}")
 
-def getUserDB(filename, startdate, enddate):
+        sreport = subprocess.Popen(command, stdout=subprocess.PIPE, text=True)
+        output, err = sreport.communicate()
+
+        logging.debug(f"Subprocess finished")
+    except:
+        logging.error(f"Running sreport failed. Command used: '{' '.join(command)}'")
+        exit(1)
+
     try:
-        userData = pandas.read_csv(filename, parse_dates = [5,6])
+        logging.debug(f"Interpreting output as csv")
+
+        usage_data = pd.read_csv(StringIO(output), delimiter='|', skiprows=4)
+
+        if options.cpu_time:
+            usage_data = usage_data[pd.notnull(usage_data["Login"])]
     except:
-        print("Error reading user data from %s", filename)
-    # Remove potential duplicate entries outside our time window
-    # 1. Remove all user entries that started later than our time window
-    userData = userData[userData.StartDate < enddate]
-    # 2. Remove all user entries that finished before our time window
-    userData = userData[(userData.EndDate > startdate) | (pandas.isnull(userData.EndDate))]
+        logging.error(f"Failed to read sreport output as csv.")
+        logging.debug(f"The output was:\n{output}")
+        exit(1)
 
-    # Use the last occurence for each user as the one to account for.
-    # This is not completely valid, but separating the usage without going to 
-    # a resolution of single day is impossible.
-    # 1. Sort on startdate
-    userData = userData.sort_values(by='StartDate')
-    # 2. Remove duplicates and keep last
-    userData = userData.drop_duplicates(subset = ['Username'])
-    
-    # Remove unnamed first column
-    userData = userData.drop(columns=['Unnamed: 0'])
-    
-    # Rename column Username to Login
-    userData.rename({'Username' : 'Login'}, axis =1, inplace=True)
-   
-    return userData
+    if usage_data.empty:
+        logging.error(f"sreport returned no entry for the given period.")
+        exit(1)
 
-def getUsageTable(usage, users):
-    usageTable = usage.set_index('Login').join(users.set_index('Login'))
-    return usageTable
+    return usage_data
 
-  
+
+def get_database_data(usage, options, configs):
+    logging.debug("Querying the database for user data")
+    db_conf = configs["database"]
+
+    try:
+        engine = sqlalchemy.create_engine(
+            f"mysql+mysqlconnector://"
+            f"{db_conf['username']}:{db_conf['password']}"
+            f"@{db_conf['host']}/{db_conf['database']}"
+        )
+    except:
+        logging.error("Failed to connect to database")
+        exit(1)
+
+    username_list = (f"'{username}'" for username in usage["Login"])
+    start_date = f"'{options.start_date}'"
+    end_date = f"'{options.end_date}'"
+
+    # The script uses a hardcoded query in order to
+    # not duplicate code from / be dependent on "rug-cit-hpc/hb-user-management"
+    query = f"""
+            SELECT
+                users.username AS Login,
+                users.name AS Name,
+                departments.name AS Department,
+                faculties.name AS Faculty,
+                affiliations.start_date AS StartDate
+            FROM users
+            LEFT JOIN affiliations
+                ON users.id = affiliations.user_id
+            LEFT JOIN departments
+                ON affiliations.department_id = departments.id
+            LEFT JOIN faculties
+                ON departments.faculty_id = faculties.id
+            WHERE users.username IN ({', '.join(username_list)})
+              AND users.start_date <= {end_date}
+              AND (users.end_date >= {start_date} OR users.end_date IS NULL)
+              AND affiliations.start_date <= {end_date}
+              AND (affiliations.end_date >= {start_date} OR affiliations.end_date IS NULL)
+              AND departments.date_added <= {end_date}
+              AND (departments.date_removed >= {start_date} OR departments.date_removed IS NULL)
+              AND faculties.date_added <= {end_date}
+              AND (faculties.date_removed >= {start_date} OR faculties.date_removed IS NULL)
+            ;"""
+
+    try:
+        user_data = pd.read_sql(query, engine, parse_dates=["StartDate"])
+    except:
+        logging.error("Failed to query the database with pandas and sqlalchemy")
+        exit(1)
+
+    logging.debug("Using only the latest affiliation for each user")
+
+    user_data = user_data.sort_values(by='StartDate', ascending=False)
+    user_data = user_data.drop_duplicates(subset=['Login'])
+    user_data = user_data.drop(["StartDate"], axis=1)
+
+    if user_data["Department"].isnull().any():
+        logging.error("Some users from the database have no department affiliation. "
+                      "Marking them as 'Unknown Department'")
+        user_data["Department"] = user_data["Department"].fillna("Unknown Department")
+
+    if user_data["Faculty"].isnull().any():
+        logging.error("Some users from the database have no faculty affiliation. "
+                      "Marking them as 'Unknown Faculty'")
+        user_data["Faculty"] = user_data["Faculty"].fillna("Unknown Faculty")
+
+    return user_data
+
+
+def combine(usage, user, options):
+    logging.debug("Combining the usage data with the user data.")
+    combined = usage.set_index("Login").join(user.set_index("Login"))
+
+    logging.debug("Keeping only the requested identifiers")
+    data = combined.reset_index()
+
+    dropped = ["Name", "Login"]
+    used = "Name" if options.name else "Login"
+
+    data["User"] = data[used]
+    data = data.drop(dropped, axis=1)
+
+    logging.debug("Grouping data")
+    if options.faculty or options.department:
+        # If any flags apart from -u are set, group data before returning
+        grouping = ["Account"]
+
+        if options.faculty:
+            grouping.append("Faculty")
+
+        if options.department:
+            grouping.append("Department")
+
+        if options.user:
+            grouping.append("User")
+
+        data = data.groupby(grouping)["Used"].sum()
+
+        if options.sort:
+            logging.debug("Sorting entries")
+            data = data.sort_values(ascending=False)
+    else:
+        # Otherwise return the table as is
+        data = data.set_index("User")
+
+        if options.sort:
+            logging.debug("Sorting entries")
+            data = data.sort_values(by="Used", ascending=False)
+
+    return data
+
+
+def output_data(data, options):
+    # Print to screen
+    if options.view:
+        logging.debug("Printing data on screen")
+        print(data.to_string())
+
+    # Write to csv
+    if options.csv:
+        # Base name
+        csv_name = "usage"
+
+        # Metric
+        if options.cpu_time:
+            csv_name += "_cpu_" + options.time_unit
+        elif options.jobs:
+            csv_name += "_jobs"
+
+        # Time period
+        csv_name += "_" + str(options.start_date) + "_" + str(options.end_date) + ".csv"
+
+        logging.debug(f"Writing data to csv file {csv_name}")
+
+        data.to_csv(csv_name)
+
+
 def main():
-    options = getargs()
+    setup_logging()
+    options = parse_args()
+    configs = parse_configs(options)
 
-    if options.debug:
-        print("Retrieving data from sReport.")
-    usage = CPUTime(str(options.startdate), str(options.enddate), str(options.time))
+    # Read sreport data
+    usage_data = get_usage_data(options)
 
-    if options.debug:
-        print("Reading user data from %s" % options.userdata)
-    users = getUserDB(options.userdata, options.startdate, options.enddate)
-       
-    if options.debug:
-       print("Combining sreport data with user data")
-    usageTable = getUsageTable(usage, users)
+    if options.jobs:
+        output_data(usage_data, options)
+        exit(0)
 
-    if options.researchgroup:
-       usageTable = usageTable.groupby(['Department','Account','Faculty']).sum()
+    # Gather database data
+    user_data = get_database_data(usage_data, options, configs)
 
-    if options.faculty:
-       usageTable = usageTable.groupby(['Faculty','Account']).sum()
+    # Combine the two
+    combined_data = combine(usage_data, user_data, options)
+
+    # Output the data
+    output_data(combined_data, options)
 
 
-    usageTable.to_csv("usage.csv")
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
