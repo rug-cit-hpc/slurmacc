@@ -61,8 +61,9 @@ def parse_args():
                       help=f"Output time unit for -c. Must be one of ({', '.join(time_units)}), "
                            f"where p is %.Defaults to minutes.")
 
-    parser.add_option("-n", "--name", dest="name", default=False, action="store_true",
-                      help="Use the full name instead of the username for user accounting information")
+    parser.add_option("-m", "--monthly", dest="monthly", default=False, action="store_true",
+                      help="Present accounting as a series of columns, each representing a different "
+                           "month")
 
     parser.add_option("-u", "--user", dest="user", default=False, action="store_true",
                       help="Present accounting information for individual users")
@@ -193,7 +194,7 @@ def get_usage_data(options):
 
     command.extend(["start=" + str(options.start_date), "end=" + str(options.end_date)])
     if options.accounts != "":
-        command.append("Accounts="+options.accounts)
+        command.append("Accounts=" + options.accounts)
 
     try:
         logging.debug(f"Starting subprocess with command {' '.join(command)}")
@@ -302,11 +303,8 @@ def combine(usage, user, options):
     logging.debug("Keeping only the requested identifiers")
     data = combined.reset_index()
 
-    dropped = ["Name", "Login"]
-    used = "Name" if options.name else "Login"
-
-    data["User"] = data[used]
-    data = data.drop(dropped, axis=1)
+    data["User"] = data["Login"]
+    data = data.drop(["Login"], axis=1)
 
     logging.debug("Grouping data")
     if options.faculty or options.department:
@@ -320,7 +318,9 @@ def combine(usage, user, options):
             grouping.append("Department")
 
         if options.user:
-            grouping.append("User")
+            grouping.extend(["User", "Name"])
+        else:
+            data = data.drop(["Name"], axis=1)
 
         data = data.groupby(grouping)["Used"].sum()
 
