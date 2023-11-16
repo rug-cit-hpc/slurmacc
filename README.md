@@ -52,12 +52,15 @@ Options:
                         Mutually exclusive with -j. Default behaviour if no
                         metric argument is provided
   -j, --jobs            Report on number of jobs run. Mutually exclusive with
-                        -c
+                        -c or -m
   -t TIME_UNIT, --time=TIME_UNIT
                         Output time unit for -c. Must be one of (h, m, s, p),
                         where p is %.Defaults to minutes.
-  -n, --name            Use the full name instead of the username for user
-                        accounting information
+  -m, --monthly         Present accounting as a series of columns, each
+                        representing a different month. Mutually exclusive
+                        with -j. Creates a report containing each full month
+                        starting with the start date month, up to and NOT
+                        including the end date month
   -u, --user            Present accounting information for individual users
   -d, --department      Present accounting information for departments
   -f, --faculty         Present accounting information faculties
@@ -68,6 +71,7 @@ Options:
                         provided
   -x, --csv             Output results in comma separated value format, in a
                         file named usage_<metric>_<start-date>-<end-date>
+
 ```
 
 Running the script for the first time creates a configuration file that needs to be modified with the correct 
@@ -93,4 +97,11 @@ department and users.
 
 ```commandline
 slurmacc.py -t h -f -d -u -x 
+```
+
+The following command prints a breakdown of the CPU time, in seconds, for the months Jun-Oct 2023, where the usage for 
+each month has been separated on a different column. 
+
+```commandline
+slurmacc.py -s 2023-06-1 -e 2023-11-01 -c -t s -m
 ```
