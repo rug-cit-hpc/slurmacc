@@ -53,7 +53,7 @@ def parse_args():
                            "Default behaviour if no metric argument is provided")
 
     parser.add_option("-j", "--jobs", dest="jobs", default=False, action="store_true",
-                      help="Report on number of jobs run. Mutually exclusive with -c")
+                      help="Report on number of jobs run. Mutually exclusive with -c or -m")
 
     time_units = ["h", "m", "s", "p"]
 
@@ -61,8 +61,11 @@ def parse_args():
                       help=f"Output time unit for -c. Must be one of ({', '.join(time_units)}), "
                            f"where p is %.Defaults to minutes.")
 
-    parser.add_option("-n", "--name", dest="name", default=False, action="store_true",
-                      help="Use the full name instead of the username for user accounting information")
+    parser.add_option("-m", "--monthly", dest="monthly", default=False, action="store_true",
+                      help="Present accounting as a series of columns, each representing a different "
+                           "month. Mutually exclusive with -j. Creates a report containing each full "
+                           "month starting with the start date month, up to and NOT including the end "
+                           "date month")
 
     parser.add_option("-u", "--user", dest="user", default=False, action="store_true",
                       help="Present accounting information for individual users")
@@ -108,9 +111,6 @@ def parse_args():
         logging.error("start date cannot be after end date")
         exit(1)
 
-    options.start_date = options.start_date.strftime("%Y-%m-%d")
-    options.end_date = options.end_date.strftime("%Y-%m-%d")
-
     if options.cpu_time and options.jobs:
         logging.error("Options -c and -j are mutually exclusive")
         exit(1)
@@ -126,6 +126,10 @@ def parse_args():
     if not any([options.view, options.csv]):
         logging.debug("No output argument provided. Printing to screen")
         options.view = True
+
+    if options.jobs and options.monthly:
+        logging.error("Options -j and -m are mutually exclusive")
+        exit(1)
 
     logging.debug("Finished checking arguments")
     return options
@@ -191,9 +195,9 @@ def get_usage_data(options):
     elif options.jobs:
         command.extend(["job", "SizesByAccount", "PrintJobCount", "FlatView"])
 
-    command.extend(["start=" + str(options.start_date), "end=" + str(options.end_date)])
+    command.extend(["start=" + options.start_date.strftime("%Y-%m-%d"), "end=" + options.end_date.strftime("%Y-%m-%d")])
     if options.accounts != "":
-        command.append("Accounts="+options.accounts)
+        command.append("Accounts=" + options.accounts)
 
     try:
         logging.debug(f"Starting subprocess with command {' '.join(command)}")
@@ -219,7 +223,8 @@ def get_usage_data(options):
         exit(1)
 
     if usage_data.empty:
-        logging.error(f"sreport returned no entry for the given period.")
+        logging.error(f"sreport returned no entry for the given period. {options.start_date.strftime('%Y-%m-%d')} "
+                      f"to {options.end_date.strftime('%Y-%m-%d')}")
         exit(1)
 
     return usage_data
@@ -240,8 +245,8 @@ def get_database_data(usage, options, configs):
         exit(1)
 
     username_list = (f"'{username}'" for username in usage["Login"])
-    start_date = f"'{options.start_date}'"
-    end_date = f"'{options.end_date}'"
+    start_date = f"'{options.start_date.strftime('%Y-%m-%d')}'"
+    end_date = f"'{options.end_date.strftime('%Y-%m-%d')}'"
 
     # The script uses a hardcoded query in order to
     # not duplicate code from / be dependent on "rug-cit-hpc/hb-user-management"
@@ -260,13 +265,13 @@ def get_database_data(usage, options, configs):
             LEFT JOIN faculties
                 ON departments.faculty_id = faculties.id
             WHERE users.username IN ({', '.join(username_list)})
-              AND users.start_date <= {end_date}
+              AND users.start_date < {end_date}
               AND (users.end_date >= {start_date} OR users.end_date IS NULL)
-              AND affiliations.start_date <= {end_date}
+              AND affiliations.start_date < {end_date}
               AND (affiliations.end_date >= {start_date} OR affiliations.end_date IS NULL)
-              AND departments.date_added <= {end_date}
+              AND departments.date_added < {end_date}
               AND (departments.date_removed >= {start_date} OR departments.date_removed IS NULL)
-              AND faculties.date_added <= {end_date}
+              AND faculties.date_added < {end_date}
               AND (faculties.date_removed >= {start_date} OR faculties.date_removed IS NULL)
             ;"""
 
@@ -302,11 +307,8 @@ def combine(usage, user, options):
     logging.debug("Keeping only the requested identifiers")
     data = combined.reset_index()
 
-    dropped = ["Name", "Login"]
-    used = "Name" if options.name else "Login"
-
-    data["User"] = data[used]
-    data = data.drop(dropped, axis=1)
+    data["User"] = data["Login"]
+    data = data.drop(["Login"], axis=1)
 
     logging.debug("Grouping data")
     if options.faculty or options.department:
@@ -320,13 +322,18 @@ def combine(usage, user, options):
             grouping.append("Department")
 
         if options.user:
-            grouping.append("User")
+            grouping.extend(["User", "Name"])
+        else:
+            data = data.drop(["Name"], axis=1)
 
         data = data.groupby(grouping)["Used"].sum()
 
         if options.sort:
             logging.debug("Sorting entries")
             data = data.sort_values(ascending=False)
+    elif options.monthly:
+        grouping = ["Account", "User", "Name", "Faculty", "Department"]
+        data = data.groupby(grouping)["Used"].sum()
     else:
         # Otherwise return the table as is
         data = data.set_index("User")
@@ -355,12 +362,77 @@ def output_data(data, options):
         elif options.jobs:
             csv_name += "_jobs"
 
+        # Monthly
+        if options.monthly:
+            csv_name += "_monthly"
+
         # Time period
-        csv_name += "_" + str(options.start_date) + "_" + str(options.end_date) + ".csv"
+        csv_name += "_" + options.start_date.strftime("%Y-%m-%d") + "_" + options.end_date.strftime("%Y-%m-%d") + ".csv"
 
         logging.debug(f"Writing data to csv file {csv_name}")
 
         data.to_csv(csv_name)
+
+
+def process_jobs(options, configs):
+    logging.debug("Processing job request")
+
+    usage_data = get_usage_data(options)
+    return usage_data
+
+
+def process_single(options, configs):
+    logging.debug("Processing single period request")
+
+    # Read sreport data
+    usage_data = get_usage_data(options)
+
+    # Gather database data
+    user_data = get_database_data(usage_data, options, configs)
+
+    # Combine the two and return
+    combined_data = combine(usage_data, user_data, options)
+    return combined_data
+
+
+def process_multiple(options, configs):
+    logging.debug("Processing monthly report request")
+
+    start_month = options.start_date.to_period(freq='M')
+    end_month = options.end_date.to_period(freq='M')
+
+    current_month = start_month
+    current_start = current_month.start_time
+    current_end = (current_month + 1).start_time
+
+    results = []
+
+    while current_end <= end_month.start_time:
+        options.start_date = current_start
+        options.end_date = current_end
+
+        temp_res = process_single(options, configs)
+        temp_res = pd.DataFrame({current_month.strftime("%Y-%m"): temp_res}, index=temp_res.index)
+        results.append(temp_res)
+
+        current_month += 1
+        current_start = current_month.start_time
+        current_end = (current_month + 1).start_time
+
+    logging.debug("Gathered data for the entire period. Merging in one table")
+
+    res = results.pop(0)
+    for ser in results:
+        res = res.join(ser, how='outer')
+
+    res = res.fillna(0).astype(int)
+    res["Total"] = res.sum(axis=1, numeric_only=True)
+
+    if options.sort:
+        logging.debug("Sorting merged table")
+        res = res.sort_values(by="Total", ascending=False)
+
+    return res
 
 
 def main():
@@ -368,21 +440,16 @@ def main():
     options = parse_args()
     configs = parse_configs(options)
 
-    # Read sreport data
-    usage_data = get_usage_data(options)
-
+    # Process the result accordingly
     if options.jobs:
-        output_data(usage_data, options)
-        exit(0)
-
-    # Gather database data
-    user_data = get_database_data(usage_data, options, configs)
-
-    # Combine the two
-    combined_data = combine(usage_data, user_data, options)
+        result = process_jobs(options, configs)
+    elif options.monthly:
+        result = process_multiple(options, configs)
+    else:
+        result = process_single(options, configs)
 
     # Output the data
-    output_data(combined_data, options)
+    output_data(result, options)
 
 
 if __name__ == '__main__':
