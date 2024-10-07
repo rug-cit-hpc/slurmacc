@@ -1,3 +1,6 @@
+# Repository moved
+The repository for this project has moved to https://gitrepo.service.rug.nl/cit-hpc/habrok/slurm-accounting.
+
 # slurmacc
 Tools to add extra information from LDAP to the user info in SLURM sreport overviews.
 
